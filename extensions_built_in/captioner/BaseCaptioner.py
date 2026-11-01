@@ -37,7 +37,7 @@ class CaptionConfig:
         if self.path_to_caption is None:
             raise ValueError("path_to_caption is required in config")
         self.dtype = kwargs.get("dtype", "bf16")
-        self.device = kwargs.get("device", "cuda")
+        self.device = kwargs.get("device", "mps")
         self.quantize = kwargs.get("quantize", False)
         self.qtype = kwargs.get("qtype", "float8")
         self.low_vram = kwargs.get("low_vram", False)

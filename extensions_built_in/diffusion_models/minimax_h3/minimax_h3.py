@@ -617,7 +617,20 @@ class MinimaxH3Model(BaseModel):
             device = self.vae_device_torch
         if dtype is None:
             dtype = self.vae_torch_dtype
-        if self.vae.device == torch.device("cpu"):
+        # The video VAE encoder has returned garbage latents on Apple MPS (NaN
+        # or a gray smear when decoded). H3_ENCODE picks how Macs encode:
+        #   mps   - MPS GPU, model dtype (default; vae.py routes conv3d
+        #           through conv2d on MPS, which fixes the bad latents)
+        #   mps32 - MPS GPU, float32
+        #   cpu   - CPU, float32 (slow but known-good fallback)
+        encode_device = torch.device(self.vae_device_torch)
+        mode = os.environ.get("H3_ENCODE", "mps").lower()
+        if encode_device.type == "mps" and mode in ("cpu", "mps32"):
+            if mode == "cpu":
+                encode_device = torch.device("cpu")
+            if self.video_vae.device != encode_device or self.video_vae.dtype != torch.float32:
+                self.video_vae.to(encode_device, torch.float32)
+        elif self.vae.device == torch.device("cpu"):
             self.vae.to(self.vae_device_torch)
 
         items = []
@@ -641,7 +654,7 @@ class MinimaxH3Model(BaseModel):
                 self._warned_frame_trim = True
             items = [it[:, :aligned] for it in items]
 
-        batch = torch.stack(items).to(self.vae_device_torch, self.video_vae.dtype)
+        batch = torch.stack(items).to(encode_device, self.video_vae.dtype)
         latents = self.video_vae.encode(batch, sample=True)
         return latents.to(device, dtype=dtype)
 
@@ -952,7 +965,7 @@ class MinimaxH3Model(BaseModel):
             encoder_hidden_states=text_batch,
             row_timesteps=row_t.to(device),
             token_tags=token_tags.to(device),
-            position_ids=position_ids.to(device),
+            position_ids=position_ids.to(torch.float32).to(device),
             video_indices=video_indices.to(device),
             audio_indices=audio_indices.to(device),
             text_indices=text_indices.to(device),
