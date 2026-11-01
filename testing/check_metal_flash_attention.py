@@ -1,9 +1,13 @@
 """Check that attention_backend 'metal_flash' works on this Mac before a real run.
 
-Compares UMFA forward + gradients against PyTorch's MPS SDPA on Wan- and
-Minimax-H3-like shapes, times a fwd+bwd step for each, and prints UMFA's
-dispatch counters so you can see the Metal kernels ran (fp32_autograd) rather
-than the PyTorch fallback.
+For Wan- and Minimax-H3-like shapes, runs a fwd+bwd step with PyTorch's MPS
+SDPA and with UMFA, scores both against an fp32 reference (explicit
+softmax(QK^T)V, which no SDPA override can intercept), times both, and prints
+UMFA's dispatch counters so you can see the Metal kernels ran (fp32_autograd)
+rather than the PyTorch fallback.
+
+Importing UMFA replaces MPS SDPA for the whole process, so every PyTorch
+measurement is taken before the extension is imported.
 
     python testing/check_metal_flash_attention.py [--seq 4096] [--dtype bf16]
 """
@@ -17,30 +21,54 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import torch.nn.functional as F
 
-from toolkit.util.metal_flash_attention import install_metal_flash_attention, uninstall_metal_flash_attention
-
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 
+# (name, batch, heads, head_dim, is_causal)
+CASES = [
+    ("wan2.1 1.3b self-attn", 1, 12, 128, False),
+    ("wan 14b self-attn", 1, 40, 128, False),
+    ("minimax h3, no padding", 1, 24, 128, False),
+    ("causal", 1, 16, 64, True),
+]
 
-def step(q, k, v, grad_out, **kwargs):
+
+def make_inputs(b, h, d, seq, dtype):
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(b, h, seq, d, device="mps", dtype=dtype, requires_grad=True) for _ in range(3))
+    grad_out = torch.randn(b, h, seq, d, device="mps", dtype=dtype)
+    return q, k, v, grad_out
+
+
+def step(attn, q, k, v, grad_out, is_causal):
     for t in (q, k, v):
         t.grad = None
-    out = F.scaled_dot_product_attention(q, k, v, **kwargs)
-    out.backward(grad_out)
+    out = attn(q, k, v, is_causal=is_causal)
+    out.backward(grad_out.to(out.dtype))
     torch.mps.synchronize()
-    return out.detach(), [t.grad.detach() for t in (q, k, v)]
+    return [out.detach().float()] + [t.grad.detach().float() for t in (q, k, v)]
 
 
-def timed(q, k, v, grad_out, iters, **kwargs):
-    step(q, k, v, grad_out, **kwargs)  # warmup / kernel compile
+def timed_ms(attn, q, k, v, grad_out, is_causal, iters):
+    step(attn, q, k, v, grad_out, is_causal)  # warmup / kernel compile
     start = time.perf_counter()
     for _ in range(iters):
-        step(q, k, v, grad_out, **kwargs)
+        step(attn, q, k, v, grad_out, is_causal)
     return (time.perf_counter() - start) / iters * 1000
 
 
-def max_rel_err(a, b):
-    return ((a.float() - b.float()).abs().max() / b.float().abs().max().clamp_min(1e-6)).item()
+def reference_attention(q, k, v, is_causal=False):
+    """fp32 softmax(QK^T * scale)V, plain matmuls only."""
+    q, k, v = q.float(), k.float(), v.float()
+    scores = (q @ k.transpose(-2, -1)) * q.shape[-1] ** -0.5
+    if is_causal:
+        s = q.shape[-2]
+        mask = torch.ones(s, s, dtype=torch.bool, device=q.device).tril()
+        scores = scores.masked_fill(~mask, float("-inf"))
+    return scores.softmax(-1) @ v
+
+
+def rel_errs(got, ref):
+    return [((g - r).abs().max() / r.abs().max().clamp_min(1e-6)).item() for g, r in zip(got, ref)]
 
 
 def main():
@@ -51,36 +79,36 @@ def main():
     args = parser.parse_args()
     dtype = DTYPES[args.dtype]
 
-    # (name, batch, heads, head_dim, sdpa kwargs)
-    cases = [
-        ("wan2.1 1.3b self-attn", 1, 12, 128, {}),
-        ("wan 14b self-attn", 1, 40, 128, {}),
-        ("minimax h3, no padding", 1, 24, 128, {}),
-        ("causal", 1, 16, 64, {"is_causal": True}),
-    ]
+    assert "metal_sdpa_extension" not in sys.modules, "UMFA must not be imported before the torch baseline"
+    results = {}
+    for name, b, h, d, causal in CASES:
+        q, k, v, grad_out = make_inputs(b, h, d, args.seq, dtype)
+        ref = step(reference_attention, q, k, v, grad_out, causal)
+        torch_res = step(F.scaled_dot_product_attention, q, k, v, grad_out, causal)
+        torch_ms = timed_ms(F.scaled_dot_product_attention, q, k, v, grad_out, causal, args.iters)
+        results[name] = (ref, rel_errs(torch_res, ref), torch_ms)
+        del q, k, v, grad_out, torch_res
+        torch.mps.empty_cache()
 
-    import metal_sdpa_extension as ext
+    from toolkit.util.metal_flash_attention import install_metal_flash_attention
 
-    for name, b, h, d, kwargs in cases:
-        torch.manual_seed(0)
-        q, k, v = (torch.randn(b, h, args.seq, d, device="mps", dtype=dtype, requires_grad=True) for _ in range(3))
-        grad_out = torch.randn(b, h, args.seq, d, device="mps", dtype=dtype)
-
-        ref_out, ref_grads = step(q, k, v, grad_out, **kwargs)
-        ref_ms = timed(q, k, v, grad_out, args.iters, **kwargs)
-
-        install_metal_flash_attention()
+    ext = install_metal_flash_attention()
+    for name, b, h, d, causal in CASES:
+        ref, torch_errs, torch_ms = results[name]
+        q, k, v, grad_out = make_inputs(b, h, d, args.seq, dtype)
         ext.reset_dispatch_stats()
-        out, grads = step(q, k, v, grad_out, **kwargs)
+        umfa_errs = rel_errs(step(F.scaled_dot_product_attention, q, k, v, grad_out, causal), ref)
         stats = ext.get_dispatch_stats()
-        mfa_ms = timed(q, k, v, grad_out, args.iters, **kwargs)
-        uninstall_metal_flash_attention()
+        umfa_ms = timed_ms(F.scaled_dot_product_attention, q, k, v, grad_out, causal, args.iters)
 
-        errs = [max_rel_err(out, ref_out)] + [max_rel_err(g, r) for g, r in zip(grads, ref_grads)]
-        print(f"\n{name}: B={b} H={h} S={args.seq} D={d} {args.dtype}")
-        print("  rel err  out={:.2e} dq={:.2e} dk={:.2e} dv={:.2e}".format(*errs))
-        print(f"  fwd+bwd  torch {ref_ms:.1f} ms | umfa {mfa_ms:.1f} ms ({ref_ms / mfa_ms:.2f}x)")
+        print(f"\n{name}: B={b} H={h} S={args.seq} D={d} {args.dtype}{' causal' if causal else ''}")
+        print("  rel err vs fp32   out      dq       dk       dv")
+        print("    torch        " + " ".join(f"{e:.2e}" for e in torch_errs))
+        print("    umfa         " + " ".join(f"{e:.2e}" for e in umfa_errs))
+        print(f"  fwd+bwd  torch {torch_ms:.1f} ms | umfa {umfa_ms:.1f} ms ({torch_ms / umfa_ms:.2f}x)")
         print(f"  umfa path: fp32_autograd={stats['fp32_autograd']} pytorch_fallback={stats['pytorch_fallback']}")
+        del q, k, v, grad_out
+        torch.mps.empty_cache()
 
 
 if __name__ == "__main__":
