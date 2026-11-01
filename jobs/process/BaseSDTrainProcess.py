@@ -1803,7 +1803,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     if hasattr(te, 'enable_xformers_memory_efficient_attention'):
                         te.enable_xformers_memory_efficient_attention()
         
-        if self.train_config.attention_backend != 'native':
+        if self.train_config.attention_backend == 'metal_flash':
+            # not a diffusers backend; patches torch SDPA, which diffusers 'native' calls
+            from toolkit.util.metal_flash_attention import install_metal_flash_attention
+            install_metal_flash_attention()
+        elif self.train_config.attention_backend != 'native':
             if hasattr(vae, 'set_attention_backend'):
                 vae.set_attention_backend(self.train_config.attention_backend)
             if hasattr(unet, 'set_attention_backend'):
