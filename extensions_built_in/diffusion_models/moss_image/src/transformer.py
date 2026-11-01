@@ -353,9 +353,9 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
     def _time_modulation(self, times, dtype):
         half = self.params.freq_dim // 2
         freq = 10000 ** (
-            -torch.arange(half, device=times.device, dtype=torch.float64) / half
+            -torch.arange(half, device=times.device, dtype=torch.float32) / half
         )
-        phase = times.double()[:, None] * freq
+        phase = times.float()[:, None] * freq
         embedding = torch.cat((phase.cos(), phase.sin()), -1).float()
         time = self.time_embedding(embedding.to(dtype)).float()
         mod = self.shared_block_modulation(time.to(dtype)).view(times.shape[0], 6, -1)

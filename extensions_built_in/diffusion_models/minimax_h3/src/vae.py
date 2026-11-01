@@ -19,6 +19,7 @@ the token embedder, output projection, and every norm kept in fp32.
 """
 
 import math
+import os
 from contextlib import nullcontext
 
 import torch
@@ -27,6 +28,20 @@ from toolkit.models.v2._mixin import OstrisModelMixin
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+
+
+# Force contiguous tensors into conv3d: MPS conv3d can return wrong results
+# for non-contiguous (permuted) inputs. Cheap; harmless elsewhere.
+FORCE_CONTIGUOUS = True
+
+
+def _mps_sync(t):
+    """MPS: wait for queued GPU work to finish. Without this the encoder
+    intermittently returns all-NaN latents on Apple Silicon (async/race bug);
+    a no-op on CUDA/CPU."""
+    if t.device.type == "mps":
+        torch.mps.synchronize()
+    return t
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -91,6 +106,31 @@ LATENTS_STD = [
 # ---------------------------------------------------------------------------
 
 
+def conv3d_via_conv2d(x, weight, bias, stride):
+    """Exact conv3d (no padding) built from kernel_t conv2d calls, with frames
+    folded into the batch. Used on Apple MPS, where conv3d with kernel > 1 in
+    the default NCDHW layout can return wrong results on some macOS versions
+    (pytorch/pytorch#197114)."""
+    st, sh, sw = stride
+    b, c, t, h, w = x.shape
+    kt = weight.shape[2]
+    t_out = (t - kt) // st + 1
+    out = None
+    for k in range(kt):
+        xs = x[:, :, k : k + st * (t_out - 1) + 1 : st]
+        xs = xs.permute(0, 2, 1, 3, 4).reshape(b * t_out, c, h, w)
+        y = F.conv2d(xs, weight[:, :, k], None, stride=(sh, sw))
+        out = y if out is None else out + y
+    if bias is not None:
+        out = out + bias.view(1, -1, 1, 1)
+    _, co, ho, wo = out.shape
+    return out.reshape(b, t_out, co, ho, wo).permute(0, 2, 1, 3, 4).contiguous()
+
+
+# set H3_MPS_CONV3D=native to use MPS's own conv3d again
+_MPS_CONV3D_VIA_2D = os.environ.get("H3_MPS_CONV3D", "").lower() != "native"
+
+
 class CausalConv3d(nn.Conv3d):
     """Conv3d with symmetric reflect spatial padding and causal (front-only,
     zeros) temporal padding of ``kernel_t - 1`` frames."""
@@ -107,7 +147,15 @@ class CausalConv3d(nn.Conv3d):
             x = F.pad(x, (p, p, p, p, 0, 0), mode="reflect")
         t_pad = self.kernel_size[0] - 1
         if t_pad > 0:
-            x = F.pad(x, (0, 0, 0, 0, t_pad, 0))
+            # zero frames via torch.cat, not F.pad: MPS's constant pad on the
+            # time axis of a 5D tensor silently corrupts data once H*W >= 65536
+            # (pytorch/pytorch#194922). Bit-identical to F.pad everywhere.
+            zeros = x.new_zeros(x.shape[0], x.shape[1], t_pad, *x.shape[3:])
+            x = torch.cat([zeros, x], dim=2)
+        if FORCE_CONTIGUOUS:
+            x = x.contiguous()
+        if x.device.type == "mps" and _MPS_CONV3D_VIA_2D:
+            return conv3d_via_conv2d(x, self.weight, self.bias, self.stride)
         return F.conv3d(x, self.weight, self.bias, stride=self.stride)
 
 
@@ -119,7 +167,8 @@ class FrameGroupNorm(nn.GroupNorm):
         b, c, t, h, w = x.shape
         x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
         x = super().forward(x)
-        return x.view(b, t, c, h, w).permute(0, 2, 1, 3, 4)
+        x = x.view(b, t, c, h, w).permute(0, 2, 1, 3, 4)
+        return x.contiguous() if FORCE_CONTIGUOUS else x
 
 
 class ResnetBlock3d(nn.Module):
@@ -509,8 +558,10 @@ class MiniMaxH3VideoVAE(nn.Module, OstrisModelMixin):
             time_down=time_down,
             norm_num_groups=norm_num_groups,
         )
-        self.quant_conv = nn.Conv3d(2 * latent_channels, 2 * latent_channels, 1)
-        self.post_quant_conv = nn.Conv3d(latent_channels, latent_channels, 1)
+        # CausalConv3d with k=1 is a plain Conv3d (same weights/keys) that
+        # also gets the MPS conv3d workaround
+        self.quant_conv = CausalConv3d(2 * latent_channels, 2 * latent_channels, 1)
+        self.post_quant_conv = CausalConv3d(latent_channels, latent_channels, 1)
         self.decoder = ViTDecoder3d(
             in_channels=latent_channels,
             out_channels=out_channels,
@@ -655,7 +706,7 @@ class MiniMaxH3VideoVAE(nn.Module, OstrisModelMixin):
     def _encode_clip(self, x):
         """Encode one temporal clip to moments, spatially tiled when enabled."""
         if not self.use_tiling:
-            return self.quant_conv(self.encoder(x))
+            return _mps_sync(self.quant_conv(self.encoder(_mps_sync(x))))
 
         y_starts, y_lens, y_overlaps = self._split_tiles(x.shape[-2])
         x_starts, x_lens, x_overlaps = self._split_tiles(x.shape[-1])
@@ -664,7 +715,7 @@ class MiniMaxH3VideoVAE(nn.Module, OstrisModelMixin):
             row = []
             for j_pos, j_len in zip(x_starts, x_lens):
                 tile = x[..., i_pos : i_pos + i_len, j_pos : j_pos + j_len]
-                row.append(self.quant_conv(self.encoder(tile)))
+                row.append(_mps_sync(self.quant_conv(self.encoder(_mps_sync(tile)))))
             rows.append(row)
         ratio = self.spatial_compression
         return self._stitch_tiles(
@@ -689,6 +740,7 @@ class MiniMaxH3VideoVAE(nn.Module, OstrisModelMixin):
                     i_pos // ratio : (i_pos + i_len) // ratio,
                     j_pos // ratio : (j_pos + j_len) // ratio,
                 ]
+                tile = tile.to(dtype=self.post_quant_conv.weight.dtype)
                 row.append(self.decoder(self.post_quant_conv(tile)))
             rows.append(row)
         return self._stitch_tiles(rows, y_overlaps, x_overlaps)
