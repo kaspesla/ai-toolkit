@@ -16,10 +16,6 @@ if "SEED" in os.environ:
 
 sys.path.insert(0, os.getcwd())
 
-if os.environ.get("NAN_HUNT") == "1":
-    import nan_hunt
-    nan_hunt.install()
-
 # The UI launches jobs with no console; keep anything we shell out to (torch
 # compiles, HF git downloads) from flashing a console window. Must come before
 # any import that might spawn a subprocess.
