@@ -90,7 +90,8 @@ def model_step(attn, x, w_qkv, w_out, h, is_causal):
         t.grad = None
     b, s, _ = x.shape
     q, k, v = (t.view(b, s, h, -1).transpose(1, 2) for t in (x @ w_qkv).chunk(3, dim=-1))
-    out = attn(q, k, v, is_causal=is_causal).transpose(1, 2).reshape(b, s, -1) @ w_out
+    # .to(): the fp32 reference returns fp32
+    out = attn(q, k, v, is_causal=is_causal).to(x.dtype).transpose(1, 2).reshape(b, s, -1) @ w_out
     out.float().square().mean().backward()
     torch.mps.synchronize()
     return [out.detach().float()] + [t.grad.detach().float() for t in (x, w_qkv, w_out)]
