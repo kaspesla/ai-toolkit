@@ -6,6 +6,11 @@ softmax(QK^T)V, which no SDPA override can intercept), times both, and prints
 UMFA's dispatch counters so you can see the Metal kernels ran (fp32_autograd)
 rather than the PyTorch fallback.
 
+A model-shaped training case runs a few fwd+bwd steps the way the models call
+SDPA (q/k/v chunked from a fused projection that is still queued on the GPU,
+gradients through matmuls) and checks the grads stay finite and correct. It
+catches ordering races between PyTorch's MPS queue and UMFA's.
+
 Importing UMFA replaces MPS SDPA for the whole process, so every PyTorch
 measurement is taken before the extension is imported.
 
@@ -61,6 +66,34 @@ def make_nograd_inputs(seq, dtype, layout, masked, b=1, h=24, d=128):
         mask = torch.ones(b, 1, 1, seq, dtype=torch.bool, device="mps")
         mask[..., -seq // 8:] = False
     return q, k, v, mask
+
+
+# (name, heads, head_dim, is_causal); batch 1
+MODEL_CASES = [
+    ("training through fused qkv projection (Minimax H3)", 24, 128, False),
+]
+MODEL_STEPS = 3
+
+
+def make_model_inputs(seq, dtype, h, d):
+    torch.manual_seed(0)
+    dim = h * d
+    x = torch.randn(1, seq, dim, device="mps", dtype=dtype, requires_grad=True)
+    w_qkv = (torch.randn(dim, 3 * dim, device="mps", dtype=dtype) * dim ** -0.5).requires_grad_()
+    w_out = (torch.randn(dim, dim, device="mps", dtype=dtype) * dim ** -0.5).requires_grad_()
+    return x, w_qkv, w_out
+
+
+def model_step(attn, x, w_qkv, w_out, h, is_causal):
+    """fwd+bwd with no syncs between the projections and attention."""
+    for t in (x, w_qkv, w_out):
+        t.grad = None
+    b, s, _ = x.shape
+    q, k, v = (t.view(b, s, h, -1).transpose(1, 2) for t in (x @ w_qkv).chunk(3, dim=-1))
+    out = attn(q, k, v, is_causal=is_causal).transpose(1, 2).reshape(b, s, -1) @ w_out
+    out.float().square().mean().backward()
+    torch.mps.synchronize()
+    return [out.detach().float()] + [t.grad.detach().float() for t in (x, w_qkv, w_out)]
 
 
 def make_inputs(b, h, d, seq, dtype):
@@ -135,6 +168,15 @@ def main():
         del q, k, v, grad_out, torch_res
         torch.mps.empty_cache()
 
+    model_results = {}
+    for name, h, d, causal in [] if args.inference_only else MODEL_CASES:
+        x, w_qkv, w_out = make_model_inputs(args.seq, dtype, h, d)
+        ref = model_step(reference_attention, x, w_qkv, w_out, h, causal)
+        torch_res = model_step(F.scaled_dot_product_attention, x, w_qkv, w_out, h, causal)
+        model_results[name] = (ref, rel_errs(torch_res, ref))
+        del x, w_qkv, w_out, torch_res
+        torch.mps.empty_cache()
+
     from toolkit.util.metal_flash_attention import install_metal_flash_attention
 
     ext = install_metal_flash_attention()
@@ -172,6 +214,25 @@ def main():
         print(f"  fwd+bwd  torch {torch_ms:.1f} ms | umfa {umfa_ms:.1f} ms ({torch_ms / umfa_ms:.2f}x)")
         print(f"  umfa path: fp32_autograd={stats['fp32_autograd']} pytorch_fallback={stats['pytorch_fallback']}")
         del q, k, v, grad_out
+        torch.mps.empty_cache()
+
+    for name, h, d, causal in [] if args.inference_only else MODEL_CASES:
+        ref, torch_errs = model_results[name]
+        x, w_qkv, w_out = make_model_inputs(args.seq, dtype, h, d)
+        ext.reset_dispatch_stats()
+        # Worst error over several steps: a race shows up on some steps, not all.
+        steps = [rel_errs(model_step(F.scaled_dot_product_attention, x, w_qkv, w_out, h, causal), ref)
+                 for _ in range(MODEL_STEPS)]
+        umfa_errs = [max(errs) for errs in zip(*steps)]
+        stats = ext.get_dispatch_stats()
+        bad = any(e != e or e > max(4 * t, 2e-2) for e, t in zip(umfa_errs, torch_errs))
+        print(f"\n{name}: B=1 H={h} S={args.seq} D={d} {args.dtype}, worst of {MODEL_STEPS} steps  "
+              f"[{'WRONG GRADIENTS' if bad else 'OK'}]")
+        print("  rel err vs fp32   out      dx       dw_qkv   dw_out")
+        print("    torch        " + " ".join(f"{e:.2e}" for e in torch_errs))
+        print("    umfa         " + " ".join(f"{e:.2e}" for e in umfa_errs))
+        print(f"  umfa path: fp32_autograd={stats['fp32_autograd']} pytorch_fallback={stats['pytorch_fallback']}")
+        del x, w_qkv, w_out
         torch.mps.empty_cache()
 
 
