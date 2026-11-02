@@ -31,6 +31,30 @@ CASES = [
     ("causal", 1, 16, 64, True),
 ]
 
+# Inference (no grad) takes UMFA's in-stream path, which reads strided inputs
+# directly. "bshd" builds (B, S, H, D) and transposes to BHSD the way Minimax H3
+# and diffusers call SDPA, so the kernel sees non-contiguous q/k/v.
+# (name, layout, padding mask)
+NOGRAD_CASES = [
+    ("inference, contiguous", "bhsd", False),
+    ("inference, transposed (as models call it)", "bshd", False),
+    ("inference, transposed + padding mask", "bshd", True),
+]
+
+
+def make_nograd_inputs(seq, dtype, layout, masked, b=1, h=24, d=128):
+    torch.manual_seed(0)
+    shape = (b, h, seq, d) if layout == "bhsd" else (b, seq, h, d)
+    q, k, v = (torch.randn(shape, device="mps", dtype=dtype) for _ in range(3))
+    if layout == "bshd":
+        q, k, v = (t.transpose(1, 2) for t in (q, k, v))
+    mask = None
+    if masked:
+        # (B, 1, 1, S) bool, True = attend, last 1/8 of keys padded out (Minimax H3 style)
+        mask = torch.ones(b, 1, 1, seq, dtype=torch.bool, device="mps")
+        mask[..., -seq // 8:] = False
+    return q, k, v, mask
+
 
 def make_inputs(b, h, d, seq, dtype):
     torch.manual_seed(0)
@@ -56,7 +80,7 @@ def timed_ms(attn, q, k, v, grad_out, is_causal, iters):
     return (time.perf_counter() - start) / iters * 1000
 
 
-def reference_attention(q, k, v, is_causal=False):
+def reference_attention(q, k, v, is_causal=False, attn_mask=None):
     """fp32 softmax(QK^T * scale)V, plain matmuls only."""
     q, k, v = q.float(), k.float(), v.float()
     scores = (q @ k.transpose(-2, -1)) * q.shape[-1] ** -0.5
@@ -64,6 +88,8 @@ def reference_attention(q, k, v, is_causal=False):
         s = q.shape[-2]
         mask = torch.ones(s, s, dtype=torch.bool, device=q.device).tril()
         scores = scores.masked_fill(~mask, float("-inf"))
+    if attn_mask is not None:
+        scores = scores.masked_fill(~attn_mask, float("-inf"))
     return scores.softmax(-1) @ v
 
 
@@ -76,12 +102,24 @@ def main():
     parser.add_argument("--seq", type=int, default=4096)
     parser.add_argument("--dtype", choices=DTYPES, default="bf16")
     parser.add_argument("--iters", type=int, default=5)
+    parser.add_argument("--inference-only", action="store_true", help="skip the fwd+bwd training cases")
     args = parser.parse_args()
     dtype = DTYPES[args.dtype]
+    cases = [] if args.inference_only else CASES
 
     assert "metal_sdpa_extension" not in sys.modules, "UMFA must not be imported before the torch baseline"
+    nograd_results = {}
+    with torch.no_grad():
+        for name, layout, masked in NOGRAD_CASES:
+            q, k, v, mask = make_nograd_inputs(args.seq, dtype, layout, masked)
+            ref = reference_attention(q, k, v, attn_mask=mask)
+            torch_out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask).float()
+            nograd_results[name] = (ref, rel_errs([torch_out], [ref])[0])
+            del q, k, v, mask, torch_out
+            torch.mps.empty_cache()
+
     results = {}
-    for name, b, h, d, causal in CASES:
+    for name, b, h, d, causal in cases:
         q, k, v, grad_out = make_inputs(b, h, d, args.seq, dtype)
         ref = step(reference_attention, q, k, v, grad_out, causal)
         torch_res = step(F.scaled_dot_product_attention, q, k, v, grad_out, causal)
@@ -93,7 +131,26 @@ def main():
     from toolkit.util.metal_flash_attention import install_metal_flash_attention
 
     ext = install_metal_flash_attention()
-    for name, b, h, d, causal in CASES:
+    for name, layout, masked in NOGRAD_CASES:
+        ref, torch_err = nograd_results[name]
+        q, k, v, mask = make_nograd_inputs(args.seq, dtype, layout, masked)
+        ext.reset_dispatch_stats()
+        with torch.no_grad():
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        torch.mps.synchronize()
+        stats = ext.get_dispatch_stats()
+        umfa_err = rel_errs([out.float()], [ref])[0]
+        ok = "OK" if umfa_err < max(4 * torch_err, 2e-2) else "WRONG OUTPUT"
+        print(f"\n{name}: B=1 H=24 S={args.seq} D=128 {args.dtype}  [{ok}]")
+        print(f"  rel err vs fp32  torch {torch_err:.2e} | umfa {umfa_err:.2e}")
+        print(
+            f"  umfa path: instream={stats['fp32_instream']} direct={stats['fp32_direct']} "
+            f"pytorch_fallback={stats['pytorch_fallback']}"
+        )
+        del q, k, v, mask, out
+        torch.mps.empty_cache()
+
+    for name, b, h, d, causal in cases:
         ref, torch_errs, torch_ms = results[name]
         q, k, v, grad_out = make_inputs(b, h, d, args.seq, dtype)
         ext.reset_dispatch_stats()
