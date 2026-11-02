@@ -34,20 +34,27 @@ CASES = [
 # Inference (no grad) takes UMFA's in-stream path, which reads strided inputs
 # directly. "bshd" builds (B, S, H, D) and transposes to BHSD the way Minimax H3
 # and diffusers call SDPA, so the kernel sees non-contiguous q/k/v.
+# "qkv" chunks one fused projection like Minimax H3's qkv_proj, so k and v also
+# start at a non-zero offset into the shared buffer.
 # (name, layout, padding mask)
 NOGRAD_CASES = [
     ("inference, contiguous", "bhsd", False),
     ("inference, transposed (as models call it)", "bshd", False),
+    ("inference, fused qkv chunks (Minimax H3)", "qkv", False),
     ("inference, transposed + padding mask", "bshd", True),
 ]
 
 
 def make_nograd_inputs(seq, dtype, layout, masked, b=1, h=24, d=128):
     torch.manual_seed(0)
-    shape = (b, h, seq, d) if layout == "bhsd" else (b, seq, h, d)
-    q, k, v = (torch.randn(shape, device="mps", dtype=dtype) for _ in range(3))
-    if layout == "bshd":
-        q, k, v = (t.transpose(1, 2) for t in (q, k, v))
+    if layout == "qkv":
+        qkv = torch.randn(b, seq, 3 * h * d, device="mps", dtype=dtype)
+        q, k, v = (t.view(b, seq, h, d).transpose(1, 2) for t in qkv.chunk(3, dim=-1))
+    else:
+        shape = (b, h, seq, d) if layout == "bhsd" else (b, seq, h, d)
+        q, k, v = (torch.randn(shape, device="mps", dtype=dtype) for _ in range(3))
+        if layout == "bshd":
+            q, k, v = (t.transpose(1, 2) for t in (q, k, v))
     mask = None
     if masked:
         # (B, 1, 1, S) bool, True = attend, last 1/8 of keys padded out (Minimax H3 style)
