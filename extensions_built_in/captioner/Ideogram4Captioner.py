@@ -129,8 +129,11 @@ class Ideogram4Captioner(Qwen3VLCaptioner):
     def get_caption_for_file(self, file_path: str) -> Optional[str]:
         try:
             # Read true dimensions before any resize so the aspect ratio is exact.
-            with Image.open(file_path) as probe:
-                width, height = probe.size
+            if self.is_video_file(file_path):
+                width, height = self.load_video_first_frame(file_path).size
+            else:
+                with Image.open(file_path) as probe:
+                    width, height = probe.size
             aspect_ratio = self.compute_aspect_ratio(width, height)
 
             img = self.load_pil_image(file_path, max_res=self.caption_config.max_res)

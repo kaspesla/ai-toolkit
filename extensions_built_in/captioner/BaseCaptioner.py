@@ -11,10 +11,12 @@ import signal
 import concurrent.futures
 from PIL import Image
 
+import cv2
 import torch
 from jobs.process import BaseExtensionProcess
 import tqdm
 
+from toolkit.data_loader import video_extensions
 from toolkit.train_tools import get_torch_dtype
 
 AITK_Status = Literal["running", "stopped", "error", "completed"]
@@ -145,8 +147,25 @@ class BaseCaptioner(BaseExtensionProcess):
                 self.step_num += 1
                 self.update_step()
 
+    def is_video_file(self, file_path: str) -> bool:
+        return os.path.splitext(file_path)[1].lower() in video_extensions
+
+    def load_video_first_frame(self, file_path: str) -> Image:
+        cap = cv2.VideoCapture(file_path)
+        try:
+            ok, frame = cap.read() if cap.isOpened() else (False, None)
+        finally:
+            cap.release()
+        if not ok or frame is None:
+            raise ValueError(f"could not read a frame from video {file_path}, skipping")
+        return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
     def load_pil_image(self, file_path: str, max_res: Optional[int] = None) -> Image:
-        image = Image.open(file_path).convert("RGB")
+        # videos are captioned from their first frame
+        if self.is_video_file(file_path):
+            image = self.load_video_first_frame(file_path)
+        else:
+            image = Image.open(file_path).convert("RGB")
         if max_res is not None:
             max_pixels = max_res * max_res
             image_pixels = image.width * image.height

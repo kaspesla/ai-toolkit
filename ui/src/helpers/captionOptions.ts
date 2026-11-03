@@ -157,7 +157,7 @@ export const captionerTypes: CaptionOption[] = [
         group: 'image',
         defaults: {
             'config.process[0].caption.model_name_or_path': ['Qwen/Qwen3-VL-8B-Instruct', defaultNameOrPath],
-            'config.process[0].caption.extensions': [extensionsImage, defaultExtensions],
+            'config.process[0].caption.extensions': [[...extensionsImage, ...extensionsVideo], defaultExtensions],
             'config.process[0].caption.caption_prompt': [defaultImageCaptionPrompt, undefined],
             'config.process[0].caption.max_res': [512, undefined],
             'config.process[0].caption.max_new_tokens': [128, undefined],
@@ -306,7 +306,7 @@ export const captionerTypes: CaptionOption[] = [
         minNewTokens: 3072,
         defaults: {
             'config.process[0].caption.model_name_or_path': ['Qwen/Qwen3-VL-8B-Instruct', defaultNameOrPath],
-            'config.process[0].caption.extensions': [extensionsImage, defaultExtensions],
+            'config.process[0].caption.extensions': [[...extensionsImage, ...extensionsVideo], defaultExtensions],
             'config.process[0].caption.caption_prompt': [defaultIdeogramCaptionPrompt, undefined],
             'config.process[0].caption.max_res': [512, undefined],
             'config.process[0].caption.max_new_tokens': [4096, undefined],
